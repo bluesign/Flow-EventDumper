@@ -2,6 +2,7 @@ package main
 
 import (
 	"database/sql"
+	"context"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -9,9 +10,11 @@ import (
 	"os"
 	"strconv"
 	"strings"
-
+"time"
 	"github.com/Jeffail/gabs"
 	badger "github.com/dgraph-io/badger/v2"
+	 "github.com/dgraph-io/badger/v2/pb"
+
 	_ "github.com/mattn/go-sqlite3"
 	flow "github.com/onflow/flow-go/model/flow"
 
@@ -80,7 +83,11 @@ func ensureDb(contractEvent string, samplePayload string) *sql.DB {
 		fieldName := value["name"].(string)
 		fieldType := xvalue["type"].(string)
 		if fieldType == "Optional" {
-			fieldType = xvalue["value"].(map[string]interface{})["type"].(string)
+			if xvalue["value"]==nil{
+				fieldType="text"
+			}else{
+				fieldType = xvalue["value"].(map[string]interface{})["type"].(string)
+			}
 		}
 
 		if strings.Contains(fieldType, "Int") || strings.Contains(fieldType, "Fix") {
@@ -103,6 +110,13 @@ func ensureDb(contractEvent string, samplePayload string) *sql.DB {
 		return nil
 	}
 
+
+	sdb.Exec(`PRAGMA journal_mode = OFF;
+	PRAGMA synchronous = 0;
+	PRAGMA cache_size = 1000000;
+	PRAGMA locking_mode = EXCLUSIVE;
+	PRAGMA temp_store = MEMORY;`)
+
 	dbMap[contractEvent] = sdb
 	return sdb
 
@@ -113,22 +127,40 @@ func main() {
 	dbMap = make(map[string]*sql.DB)
 
 	//open badger database
-	db, err := badger.Open(badger.DefaultOptions("/mnt/external1/mainnet1/protocol"))
+	db, err := badger.Open(badger.DefaultOptions("/mnt/flow/mainnet16/protocol"))
 	if err != nil {
 		log.Fatal(err)
 	}
 	defer db.Close()
 
-	//query events
-	db.View(func(txn *badger.Txn) error {
-		it := txn.NewIterator(badger.DefaultIteratorOptions)
-		defer it.Close()
-		prefix := []byte{0x66} //event prefix
-		for it.Seek(prefix); it.ValidForPrefix(prefix); it.Next() {
-			item := it.Item()
-			k := item.Key()
 
-			blockID := hex.EncodeToString(k[1:33])
+stream := db.NewStream()
+// db.NewStreamAt(readTs) for managed mode.
+
+// -- Optional settings
+stream.NumGo = 16                     // Set number of goroutines to use for iteration.
+stream.Prefix = []byte{0x66} //events 
+stream.LogPrefix = "Badger.Streaming" // For identifying stream logs. Outputs to Logger.
+stream.KeyToList = nil
+
+
+count:=0
+stream.Send = func(list *pb.KVList) error {
+  	for _,kv :=range(list.GetKv()){
+		count = count + 1
+
+		if count%10000==0{
+			fmt.Println(count)
+		}
+	//k key
+
+		k:=kv.GetKey()
+		v:=kv.GetValue()
+
+
+
+
+		blockID := hex.EncodeToString(k[1:33])
 			transactionID := hex.EncodeToString(k[33:65])
 			transactionIndex := hex.EncodeToString(k[65:69])
 			transactionIndexInt, err := strconv.ParseInt(transactionIndex, 16, 32)
@@ -136,13 +168,14 @@ func main() {
 			eventIndex := hex.EncodeToString(k[69:73])
 			eventIndexInt, err := strconv.ParseInt(eventIndex, 16, 32)
 
-			err = item.Value(func(v []byte) error {
 
-				var event flow.Event
-				err := msgpack.Unmarshal(v, &event)
+		//v value
+		var event flow.Event
+				err = msgpack.Unmarshal(v, &event)
 				if err != nil {
 					return fmt.Errorf("could not decode the event: %w", err)
 				}
+			//fmt.Println(string(event.Payload))
 
 				sdb := ensureDb(string(event.Type), string(event.Payload))
 
@@ -166,7 +199,7 @@ func main() {
 					if fieldType == "Optional" {
 						if xvalue["value"] != nil {
 							fieldType = xvalue["value"].(map[string]interface{})["type"].(string)
-							fieldValue = xvalue["value"].(map[string]interface{})["value"].(string)
+							fieldValue = fmt.Sprintf("%s",xvalue["value"].(map[string]interface{})["value"])
 						} else {
 							fieldValue = "null"
 						}
@@ -214,7 +247,7 @@ func main() {
 				}
 				args = append(args, "")
 					
-				fmt.Println(args)
+				//fmt.Println(count, args)
 
 				_, err = sdb.Exec(stmt,args...)
 				//blockID, transactionID, transactionIndexInt, eventIndexInt, event.Type, string(event.Payload), vs...)
@@ -222,13 +255,21 @@ func main() {
 					log.Fatal(err)
 				}
 
-				return nil
-			})
-			if err != nil {
-				return err
-			}
-		}
-		return nil
-	})
+	
+
+
+	}	
+	return nil 
+}
+
+if err := stream.Orchestrate(context.Background()); err != nil {
+  fmt.Println(err)
+}
+
+for{
+
+	time.Sleep(time.Second)
+}
+
 
 }
